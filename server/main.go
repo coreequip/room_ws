@@ -118,7 +118,7 @@ func (h *Hub) isAllowed(origin string) bool {
 }
 
 func (h *Hub) handleAdminCommand(cmdStr string) {
-	// Clean up the command string (it might be a JSON quoted string)
+	// Unmarshal in case it's a quoted JSON string
 	var cmdText string
 	if err := json.Unmarshal([]byte(cmdStr), &cmdText); err != nil {
 		cmdText = cmdStr
@@ -185,7 +185,7 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 		responseText = "Unknown command. Available: add, remove, list, status"
 	}
 
-	// Send response as room_ws
+	// Send response as system client "room_ws"
 	respData, _ := json.Marshal(responseText)
 	msg := Message{
 		Type:      "publish",
@@ -210,11 +210,9 @@ func (h *Hub) run() {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				// Remove from all rooms and notify
 				for roomName, subscribers := range h.rooms {
 					if _, ok := subscribers[client]; ok {
 						delete(subscribers, client)
-						// Always notify others of a leave
 						leaveMsg := Message{
 							Type:     "member_leave",
 							Room:     roomName,
@@ -283,7 +281,6 @@ func (c *Client) readPump() {
 			}
 			subscribers := c.hub.rooms[roomName]
 
-			// Send current member list
 			members := make([]string, 0, len(subscribers)+1)
 			for sub := range subscribers {
 				members = append(members, sub.id)
@@ -299,7 +296,6 @@ func (c *Client) readPump() {
 			data, _ := json.Marshal(membersMsg)
 			c.send <- data
 
-			// Notify existing members
 			joinMsg := Message{
 				Type:     "member_join",
 				Room:     roomName,
@@ -325,7 +321,6 @@ func (c *Client) readPump() {
 			if subscribers, ok := c.hub.rooms[roomName]; ok {
 				if _, ok := subscribers[c]; ok {
 					delete(subscribers, c)
-					// Always notify
 					leaveMsg := Message{
 						Type:     "member_leave",
 						Room:     roomName,
@@ -350,7 +345,6 @@ func (c *Client) readPump() {
 			}
 			c.hub.broadcast <- publishMsg
 
-			// If it's the admin room, handle command
 			if msg.Room == c.hub.adminRoom {
 				go c.hub.handleAdminCommand(string(msg.Message))
 			}
