@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -40,6 +42,32 @@ func envDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("invalid %s=%q, using default %d", key, v, def)
+		return def
+	}
+	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %g", key, v, def)
+		return def
+	}
+	return f
+}
+
 func generateID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -48,22 +76,38 @@ func generateID() string {
 	return hex.EncodeToString(b)
 }
 
+// clientIP extracts the real client IP, preferring X-Forwarded-For when behind a proxy.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i != -1 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	ip := r.RemoteAddr
+	if i := strings.LastIndex(ip, ":"); i != -1 {
+		return ip[:i]
+	}
+	return ip
+}
+
 // Message represents a WebSocket protocol message.
 type Message struct {
-	Type        string          `json:"type,omitempty"`
-	Channel     string          `json:"channel,omitempty"`
-	Version     int             `json:"version,omitempty"`
-	Room        string          `json:"room,omitempty"`
-	Message     json.RawMessage `json:"message,omitempty"`
-	Callback    *int            `json:"callback,omitempty"`
-	ClientID    string          `json:"client_id,omitempty"`
-	RequireAuth bool            `json:"require_auth,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	ID          string          `json:"id,omitempty"`
-	Timestamp   int64           `json:"timestamp,omitempty"`
-	NoEcho      bool            `json:"no_echo,omitempty"` // parsed from client; never forwarded to subscribers
-	sender      *Client         // internal routing only; excluded from JSON (unexported)
-	skipSelf    bool            // internal: suppress echo back to sender
+	Type         string          `json:"type,omitempty"`
+	Channel      string          `json:"channel,omitempty"`
+	Version      int             `json:"version,omitempty"`
+	Room         string          `json:"room,omitempty"`
+	Message      json.RawMessage `json:"message,omitempty"`
+	Callback     *int            `json:"callback,omitempty"`
+	ClientID     string          `json:"client_id,omitempty"`
+	RequireAuth  bool            `json:"require_auth,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	ID           string          `json:"id,omitempty"`
+	Timestamp    int64           `json:"timestamp,omitempty"`
+	HistoryCount int             `json:"history_count,omitempty"`
+	NoEcho       bool            `json:"no_echo,omitempty"` // parsed from client; never forwarded to subscribers
+	sender       *Client         // internal routing only; excluded from JSON (unexported)
+	skipSelf     bool            // internal: suppress echo back to sender
 }
 
 // Client represents a connected WebSocket user.
@@ -74,17 +118,47 @@ type Client struct {
 	id   string
 }
 
+// ipLimiter tracks per-IP token-bucket rate limiters for new connections.
+type ipLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit
+	b        int
+}
+
+func newIPLimiter(r rate.Limit, b int) *ipLimiter {
+	return &ipLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		r:        r,
+		b:        b,
+	}
+}
+
+func (l *ipLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.limiters[ip]
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.b)
+		l.limiters[ip] = lim
+	}
+	return lim.Allow()
+}
+
 // Hub maintains the set of active clients and broadcasts messages.
 type Hub struct {
-	clients    map[*Client]bool
-	rooms      map[string]map[*Client]bool
-	broadcast  chan Message
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
-	adminRoom  string
-	whitelist  map[string]bool
-	upgrader   websocket.Upgrader
+	clients     map[*Client]bool
+	rooms       map[string]map[*Client]bool
+	broadcast   chan Message
+	register    chan *Client
+	unregister  chan *Client
+	mu          sync.RWMutex
+	adminRoom   string
+	whitelist   map[string]bool
+	upgrader    websocket.Upgrader
+	historySize int
+	history     map[string][]Message
+	limiter     *ipLimiter // nil when rate limiting is disabled
 }
 
 func newHub() *Hub {
@@ -107,14 +181,22 @@ func newHub() *Hub {
 		}
 	}
 
+	var lim *ipLimiter
+	if r := envFloat("ROOMWS_RATE_LIMIT", 5); r > 0 {
+		lim = newIPLimiter(rate.Limit(r), envInt("ROOMWS_RATE_BURST", 10))
+	}
+
 	h := &Hub{
-		broadcast:  make(chan Message),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		clients:    make(map[*Client]bool),
-		rooms:      make(map[string]map[*Client]bool),
-		adminRoom:  adminRoom,
-		whitelist:  allowed,
+		broadcast:   make(chan Message),
+		register:    make(chan *Client),
+		unregister:  make(chan *Client),
+		clients:     make(map[*Client]bool),
+		rooms:       make(map[string]map[*Client]bool),
+		adminRoom:   adminRoom,
+		whitelist:   allowed,
+		historySize: envInt("ROOMWS_HISTORY_SIZE", 0),
+		history:     make(map[string][]Message),
+		limiter:     lim,
 	}
 	h.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -148,6 +230,27 @@ func (h *Hub) isAllowed(origin string) bool {
 		}
 	}
 	return false
+}
+
+// appendHistory stores a clean copy of msg in the room's history ring buffer.
+// Must be called with h.mu held.
+func (h *Hub) appendHistory(roomName string, msg Message) {
+	if h.historySize == 0 || roomName == h.adminRoom {
+		return
+	}
+	clean := Message{
+		Type:      msg.Type,
+		Room:      msg.Room,
+		Message:   msg.Message,
+		ID:        msg.ID,
+		Timestamp: msg.Timestamp,
+		ClientID:  msg.ClientID,
+	}
+	hist := append(h.history[roomName], clean)
+	if len(hist) > h.historySize {
+		hist = hist[len(hist)-h.historySize:]
+	}
+	h.history[roomName] = hist
 }
 
 func (h *Hub) handleAdminCommand(cmdStr string) {
@@ -263,6 +366,7 @@ func (h *Hub) run() {
 				delete(subscribers, client)
 				if len(subscribers) == 0 {
 					delete(h.rooms, roomName)
+					delete(h.history, roomName)
 					continue
 				}
 				leaveMsg := Message{
@@ -299,17 +403,21 @@ func (h *Hub) run() {
 				continue
 			}
 
-			h.mu.RLock()
+			// Use write lock to atomically update history and snapshot subscribers.
+			h.mu.Lock()
+			if msg.Type == "publish" {
+				h.appendHistory(msg.Room, msg)
+			}
 			subscribers, ok := h.rooms[msg.Room]
 			if !ok {
-				h.mu.RUnlock()
+				h.mu.Unlock()
 				continue
 			}
 			targets := make([]*Client, 0, len(subscribers))
 			for client := range subscribers {
 				targets = append(targets, client)
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 
 			var toRemove []*Client
 			for _, client := range targets {
@@ -380,6 +488,7 @@ func (c *Client) readPump() {
 
 		case "subscribe":
 			roomName := msg.Room
+			wantHistory := msg.HistoryCount
 
 			c.hub.mu.Lock()
 			if _, ok := c.hub.rooms[roomName]; !ok {
@@ -395,6 +504,18 @@ func (c *Client) readPump() {
 			}
 			members = append(members, c.id)
 			subscribers[c] = true
+
+			// Collect history snapshot while holding the lock.
+			var histMsgs []Message
+			if wantHistory > 0 && c.hub.historySize > 0 {
+				hist := c.hub.history[roomName]
+				n := wantHistory
+				if n > len(hist) {
+					n = len(hist)
+				}
+				histMsgs = make([]Message, n)
+				copy(histMsgs, hist[len(hist)-n:])
+			}
 			c.hub.mu.Unlock()
 
 			membersData, err := json.Marshal(members)
@@ -413,6 +534,16 @@ func (c *Client) readPump() {
 				break
 			}
 			c.send <- data
+
+			// Replay history oldest-first before notifying existing members.
+			for _, hMsg := range histMsgs {
+				d, err := json.Marshal(hMsg)
+				if err != nil {
+					log.Printf("marshal error for history message: %v", err)
+					continue
+				}
+				c.send <- d
+			}
 
 			joinMsg := Message{
 				Type:     "member_join",
@@ -452,6 +583,7 @@ func (c *Client) readPump() {
 					delete(subscribers, c)
 					if len(subscribers) == 0 {
 						delete(c.hub.rooms, roomName)
+						delete(c.hub.history, roomName)
 					} else {
 						leaveMsg := Message{
 							Type:     "member_leave",
@@ -523,6 +655,10 @@ func (c *Client) writePump() {
 }
 
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	if hub.limiter != nil && !hub.limiter.allow(clientIP(r)) {
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
 	conn, err := hub.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
@@ -539,13 +675,44 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	go client.readPump()
 }
 
+func healthCheck(port string) {
+	resp, err := http.Get("http://localhost:" + port + "/health")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func main() {
+	port := os.Getenv("ROOMWS_PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "-health" {
+		healthCheck(port)
+		return
+	}
+
 	hub := newHub()
 	go hub.run()
 
 	log.Printf("Admin room name: %s", hub.adminRoom)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		hub.mu.RLock()
+		clients := len(hub.clients)
+		rooms := len(hub.rooms)
+		hub.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"uptime":  time.Since(startTime).Round(time.Second).String(),
+			"clients": clients,
+			"rooms":   rooms,
+		})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.Error(w, "Not found", http.StatusNotFound)
@@ -558,14 +725,8 @@ func main() {
 		serveWs(hub, w, r)
 	})
 
-	port := os.Getenv("ROOMWS_PORT")
-	if port == "" {
-		port = "8080"
-	}
-	addr := ":" + port
-
 	server := &http.Server{
-		Addr:    addr,
+		Addr:    ":" + port,
 		Handler: mux,
 	}
 
@@ -582,7 +743,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Server starting on %s", addr)
+	log.Printf("Server starting on :%s", port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("ListenAndServe: ", err)
 	}

@@ -22,4 +22,6 @@ COPY --from=builder /app/roomws /roomws
 # Expose default port
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["/roomws", "-health"]
+
 ENTRYPOINT ["/roomws"]

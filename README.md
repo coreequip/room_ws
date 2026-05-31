@@ -24,6 +24,19 @@ ROOM.WS uses a simple JSON-based Pub/Sub protocol. It supports rooms, presence (
 - `ROOMWS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (e.g., `room.ws, localhost`). `localhost` and `127.0.0.1` are always allowed.
 - `ROOMWS_WRITE_WAIT`: Timeout for writing a message to a client (default: `10s`).
 - `ROOMWS_PONG_WAIT`: Timeout for receiving a pong from a client before disconnecting (default: `60s`). The ping interval is derived as 90% of this value.
+- `ROOMWS_RATE_LIMIT`: Max new WebSocket connections per second per IP (default: `5`). Set to `0` to disable.
+- `ROOMWS_RATE_BURST`: Burst size for the rate limiter (default: `10`).
+- `ROOMWS_HISTORY_SIZE`: Number of messages to retain per room for replay on subscribe (default: `0` = disabled).
+
+## Health Check
+
+The server exposes a `/health` endpoint that returns `200 OK` with a JSON body:
+
+```json
+{ "status": "ok", "uptime": "5m30s", "clients": 3, "rooms": 1 }
+```
+
+The Docker image uses this endpoint as its built-in `HEALTHCHECK`.
 
 ## Using the Client (`roomws.js`)
 
