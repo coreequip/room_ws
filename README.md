@@ -22,6 +22,8 @@ ROOM.WS uses a simple JSON-based Pub/Sub protocol. It supports rooms, presence (
 - `ROOMWS_PORT`: Port the server listens on (default: `8080`).
 - `ROOMWS_ADMIN_ROOM`: Name of the administrative room (default: randomly generated).
 - `ROOMWS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (e.g., `room.ws, localhost`). `localhost` and `127.0.0.1` are always allowed.
+- `ROOMWS_WRITE_WAIT`: Timeout for writing a message to a client (default: `10s`).
+- `ROOMWS_PONG_WAIT`: Timeout for receiving a pong from a client before disconnecting (default: `60s`). The ping interval is derived as 90% of this value.
 
 ## Using the Client (`roomws.js`)
 

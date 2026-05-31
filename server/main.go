@@ -20,13 +20,25 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const (
-	writeWait  = 10 * time.Second
-	pongWait   = 60 * time.Second
-	pingPeriod = (pongWait * 9) / 10
+var (
+	startTime  = time.Now()
+	writeWait  = envDuration("ROOMWS_WRITE_WAIT", 10*time.Second)
+	pongWait   = envDuration("ROOMWS_PONG_WAIT", 60*time.Second)
+	pingPeriod = pongWait * 9 / 10
 )
 
-var startTime = time.Now()
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %s", key, v, def)
+		return def
+	}
+	return d
+}
 
 func generateID() string {
 	b := make([]byte, 8)
