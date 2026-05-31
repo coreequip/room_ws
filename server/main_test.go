@@ -99,6 +99,32 @@ func TestMessageJSON(t *testing.T) {
 	}
 }
 
+func TestMessageNoEcho(t *testing.T) {
+	raw := `{"type":"publish","room":"general","message":"hello","no_echo":true}`
+	var msg Message
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+	if !msg.NoEcho {
+		t.Error("Expected NoEcho to be true")
+	}
+
+	// no_echo must not appear in outgoing broadcast (NoEcho is false on publishMsg)
+	publishMsg := Message{
+		Type:     "publish",
+		Room:     msg.Room,
+		Message:  msg.Message,
+		ClientID: "abc",
+	}
+	data, err := json.Marshal(publishMsg)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+	if strings.Contains(string(data), "no_echo") {
+		t.Errorf("no_echo must not appear in outgoing message: %s", data)
+	}
+}
+
 func TestHubNew(t *testing.T) {
 	customAdmin := "secret-admin-room"
 	os.Setenv("ROOMWS_ADMIN_ROOM", customAdmin)

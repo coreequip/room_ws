@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -9,40 +10,51 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var (
-	startTime = time.Now()
+const (
+	writeWait  = 10 * time.Second
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
 )
+
+var startTime = time.Now()
 
 func generateID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
 	return hex.EncodeToString(b)
 }
 
-// Message represents the ScaleDrone protocol format
+// Message represents a WebSocket protocol message.
 type Message struct {
-	Type         string          `json:"type,omitempty"`
-	Channel      string          `json:"channel,omitempty"`
-	Version      int             `json:"version,omitempty"`
-	Room         string          `json:"room,omitempty"`
-	Message      json.RawMessage `json:"message,omitempty"`
-	Callback     *int            `json:"callback,omitempty"`
-	ClientID     string          `json:"client_id,omitempty"`
-	RequireAuth  bool            `json:"require_auth,omitempty"`
-	Error        string          `json:"error,omitempty"`
-	ID           string          `json:"id,omitempty"`
-	Timestamp    int64           `json:"timestamp,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	Channel     string          `json:"channel,omitempty"`
+	Version     int             `json:"version,omitempty"`
+	Room        string          `json:"room,omitempty"`
+	Message     json.RawMessage `json:"message,omitempty"`
+	Callback    *int            `json:"callback,omitempty"`
+	ClientID    string          `json:"client_id,omitempty"`
+	RequireAuth bool            `json:"require_auth,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	ID          string          `json:"id,omitempty"`
+	Timestamp   int64           `json:"timestamp,omitempty"`
+	NoEcho      bool            `json:"no_echo,omitempty"` // parsed from client; never forwarded to subscribers
+	sender      *Client         // internal routing only; excluded from JSON (unexported)
+	skipSelf    bool            // internal: suppress echo back to sender
 }
 
-// Client represents a connected user
+// Client represents a connected WebSocket user.
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
@@ -50,7 +62,7 @@ type Client struct {
 	id   string
 }
 
-// Hub maintains the set of active clients and broadcasts messages
+// Hub maintains the set of active clients and broadcasts messages.
 type Hub struct {
 	clients    map[*Client]bool
 	rooms      map[string]map[*Client]bool
@@ -60,28 +72,30 @@ type Hub struct {
 	mu         sync.RWMutex
 	adminRoom  string
 	whitelist  map[string]bool
+	upgrader   websocket.Upgrader
 }
 
 func newHub() *Hub {
 	adminRoom := os.Getenv("ROOMWS_ADMIN_ROOM")
 	if adminRoom == "" {
 		b := make([]byte, 8)
-		rand.Read(b)
+		if _, err := rand.Read(b); err != nil {
+			panic(fmt.Sprintf("crypto/rand failed: %v", err))
+		}
 		adminRoom = "admin-" + hex.EncodeToString(b)
 	}
 
-	allowed := make(map[string]bool)
-	allowed["localhost"] = true
-	allowed["127.0.0.1"] = true
-
-	envOrigins := os.Getenv("ROOMWS_ALLOWED_ORIGINS")
-	if envOrigins != "" {
+	allowed := map[string]bool{
+		"localhost": true,
+		"127.0.0.1": true,
+	}
+	if envOrigins := os.Getenv("ROOMWS_ALLOWED_ORIGINS"); envOrigins != "" {
 		for _, o := range strings.Split(envOrigins, ",") {
 			allowed[strings.TrimSpace(o)] = true
 		}
 	}
 
-	return &Hub{
+	h := &Hub{
 		broadcast:  make(chan Message),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
@@ -90,11 +104,19 @@ func newHub() *Hub {
 		adminRoom:  adminRoom,
 		whitelist:  allowed,
 	}
+	h.upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return h.isAllowed(r.Header.Get("Origin"))
+		},
+	}
+	return h
 }
 
 func (h *Hub) isAllowed(origin string) bool {
 	if origin == "" {
-		return true // Allow non-browser clients or direct connections
+		return true // allow non-browser clients and direct connections
 	}
 	u, err := url.Parse(origin)
 	if err != nil {
@@ -108,7 +130,6 @@ func (h *Hub) isAllowed(origin string) bool {
 	if h.whitelist[host] {
 		return true
 	}
-
 	for allowed := range h.whitelist {
 		if strings.HasSuffix(host, "."+allowed) {
 			return true
@@ -118,7 +139,6 @@ func (h *Hub) isAllowed(origin string) bool {
 }
 
 func (h *Hub) handleAdminCommand(cmdStr string) {
-	// Unmarshal in case it's a quoted JSON string
 	var cmdText string
 	if err := json.Unmarshal([]byte(cmdStr), &cmdText); err != nil {
 		cmdText = cmdStr
@@ -159,7 +179,7 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 		}
 	case "list":
 		h.mu.RLock()
-		var list []string
+		list := make([]string, 0, len(h.whitelist))
 		for d := range h.whitelist {
 			list = append(list, d)
 		}
@@ -172,7 +192,6 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 		numClients := len(h.clients)
 		numRooms := len(h.rooms)
 		h.mu.RUnlock()
-
 		responseText = fmt.Sprintf(
 			"Status:\n- Uptime: %s\n- Clients: %d\n- Rooms: %d\n- Goroutines: %d\n- Memory: %.2f MB",
 			time.Since(startTime).Round(time.Second),
@@ -185,9 +204,12 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 		responseText = "Unknown command. Available: add, remove, list, status"
 	}
 
-	// Send response as system client "room_ws"
-	respData, _ := json.Marshal(responseText)
-	msg := Message{
+	respData, err := json.Marshal(responseText)
+	if err != nil {
+		log.Printf("marshal error in admin response: %v", err)
+		return
+	}
+	h.broadcast <- Message{
 		Type:      "publish",
 		Room:      h.adminRoom,
 		Message:   json.RawMessage(respData),
@@ -195,51 +217,110 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 		Timestamp: time.Now().UnixMilli(),
 		ClientID:  "room_ws",
 	}
-	h.broadcast <- msg
 }
 
 func (h *Hub) run() {
+	type leaveNotification struct {
+		targets []*Client
+		data    []byte
+	}
+
 	for {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
+
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				for roomName, subscribers := range h.rooms {
-					if _, ok := subscribers[client]; ok {
-						delete(subscribers, client)
-						leaveMsg := Message{
-							Type:     "member_leave",
-							Room:     roomName,
-							ClientID: client.id,
-						}
-						data, _ := json.Marshal(leaveMsg)
-						for other := range subscribers {
-							other.send <- data
-						}
+			if _, ok := h.clients[client]; !ok {
+				h.mu.Unlock()
+				continue
+			}
+			delete(h.clients, client)
+			close(client.send)
+
+			// Collect leave notifications under the lock for a consistent snapshot,
+			// then send after releasing to avoid blocking with the mutex held.
+			var notifications []leaveNotification
+			for roomName, subscribers := range h.rooms {
+				if _, ok := subscribers[client]; !ok {
+					continue
+				}
+				delete(subscribers, client)
+				if len(subscribers) == 0 {
+					delete(h.rooms, roomName)
+					continue
+				}
+				leaveMsg := Message{
+					Type:     "member_leave",
+					Room:     roomName,
+					ClientID: client.id,
+				}
+				data, err := json.Marshal(leaveMsg)
+				if err != nil {
+					log.Printf("marshal error for member_leave: %v", err)
+					continue
+				}
+				targets := make([]*Client, 0, len(subscribers))
+				for other := range subscribers {
+					targets = append(targets, other)
+				}
+				notifications = append(notifications, leaveNotification{targets, data})
+			}
+			h.mu.Unlock()
+
+			for _, n := range notifications {
+				for _, target := range n.targets {
+					select {
+					case target.send <- n.data:
+					default:
 					}
 				}
 			}
-			h.mu.Unlock()
+
 		case msg := <-h.broadcast:
+			data, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("marshal error in broadcast: %v", err)
+				continue
+			}
+
 			h.mu.RLock()
-			if subscribers, ok := h.rooms[msg.Room]; ok {
-				data, _ := json.Marshal(msg)
-				for client := range subscribers {
-					select {
-					case client.send <- data:
-					default:
+			subscribers, ok := h.rooms[msg.Room]
+			if !ok {
+				h.mu.RUnlock()
+				continue
+			}
+			targets := make([]*Client, 0, len(subscribers))
+			for client := range subscribers {
+				targets = append(targets, client)
+			}
+			h.mu.RUnlock()
+
+			var toRemove []*Client
+			for _, client := range targets {
+				if msg.skipSelf && client == msg.sender {
+					continue
+				}
+				select {
+				case client.send <- data:
+				default:
+					toRemove = append(toRemove, client)
+				}
+			}
+
+			if len(toRemove) > 0 {
+				h.mu.Lock()
+				for _, client := range toRemove {
+					if _, ok := h.clients[client]; ok {
 						close(client.send)
 						delete(h.clients, client)
 					}
 				}
+				h.mu.Unlock()
 			}
-			h.mu.RUnlock()
 		}
 	}
 }
@@ -250,10 +331,18 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Printf("error: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
 			break
 		}
 
@@ -270,30 +359,47 @@ func (c *Client) readPump() {
 				ClientID:    c.id,
 				RequireAuth: false,
 			}
-			data, _ := json.Marshal(resp)
+			data, err := json.Marshal(resp)
+			if err != nil {
+				log.Printf("marshal error in handshake: %v", err)
+				continue
+			}
 			c.send <- data
 
 		case "subscribe":
-			c.hub.mu.Lock()
 			roomName := msg.Room
+
+			c.hub.mu.Lock()
 			if _, ok := c.hub.rooms[roomName]; !ok {
 				c.hub.rooms[roomName] = make(map[*Client]bool)
 			}
 			subscribers := c.hub.rooms[roomName]
 
 			members := make([]string, 0, len(subscribers)+1)
+			joinTargets := make([]*Client, 0, len(subscribers))
 			for sub := range subscribers {
 				members = append(members, sub.id)
+				joinTargets = append(joinTargets, sub)
 			}
 			members = append(members, c.id)
+			subscribers[c] = true
+			c.hub.mu.Unlock()
 
-			membersData, _ := json.Marshal(members)
+			membersData, err := json.Marshal(members)
+			if err != nil {
+				log.Printf("marshal error for members list: %v", err)
+				break
+			}
 			membersMsg := Message{
 				Type:    "members",
 				Room:    roomName,
 				Message: json.RawMessage(membersData),
 			}
-			data, _ := json.Marshal(membersMsg)
+			data, err := json.Marshal(membersMsg)
+			if err != nil {
+				log.Printf("marshal error for members message: %v", err)
+				break
+			}
 			c.send <- data
 
 			joinMsg := Message{
@@ -301,38 +407,64 @@ func (c *Client) readPump() {
 				Room:     roomName,
 				ClientID: c.id,
 			}
-			joinData, _ := json.Marshal(joinMsg)
-			for sub := range subscribers {
-				sub.send <- joinData
+			joinData, err := json.Marshal(joinMsg)
+			if err != nil {
+				log.Printf("marshal error for member_join: %v", err)
+				break
 			}
-
-			subscribers[c] = true
-			c.hub.mu.Unlock()
+			for _, sub := range joinTargets {
+				select {
+				case sub.send <- joinData:
+				default:
+				}
+			}
 
 			if msg.Callback != nil {
 				resp := Message{Callback: msg.Callback}
-				data, _ := json.Marshal(resp)
-				c.send <- data
+				respData, err := json.Marshal(resp)
+				if err != nil {
+					log.Printf("marshal error for subscribe callback: %v", err)
+					break
+				}
+				c.send <- respData
 			}
 
 		case "unsubscribe":
-			c.hub.mu.Lock()
 			roomName := msg.Room
+
+			c.hub.mu.Lock()
+			var leaveTargets []*Client
+			var leaveData []byte
 			if subscribers, ok := c.hub.rooms[roomName]; ok {
 				if _, ok := subscribers[c]; ok {
 					delete(subscribers, c)
-					leaveMsg := Message{
-						Type:     "member_leave",
-						Room:     roomName,
-						ClientID: c.id,
-					}
-					data, _ := json.Marshal(leaveMsg)
-					for sub := range subscribers {
-						sub.send <- data
+					if len(subscribers) == 0 {
+						delete(c.hub.rooms, roomName)
+					} else {
+						leaveMsg := Message{
+							Type:     "member_leave",
+							Room:     roomName,
+							ClientID: c.id,
+						}
+						if d, err := json.Marshal(leaveMsg); err == nil {
+							leaveData = d
+							for sub := range subscribers {
+								leaveTargets = append(leaveTargets, sub)
+							}
+						} else {
+							log.Printf("marshal error for member_leave: %v", err)
+						}
 					}
 				}
 			}
 			c.hub.mu.Unlock()
+
+			for _, sub := range leaveTargets {
+				select {
+				case sub.send <- leaveData:
+				default:
+				}
+			}
 
 		case "publish":
 			publishMsg := Message{
@@ -342,9 +474,10 @@ func (c *Client) readPump() {
 				ID:        generateID(),
 				Timestamp: time.Now().UnixMilli(),
 				ClientID:  c.id,
+				sender:    c,
+				skipSelf:  msg.NoEcho,
 			}
 			c.hub.broadcast <- publishMsg
-
 			if msg.Room == c.hub.adminRoom {
 				go c.hub.handleAdminCommand(string(msg.Message))
 			}
@@ -353,28 +486,32 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			c.conn.WriteMessage(websocket.TextMessage, message)
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("write error: %v", err)
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
 
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	var upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return hub.isAllowed(r.Header.Get("Origin"))
-		},
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := hub.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
@@ -386,7 +523,6 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		id:   generateID(),
 	}
 	client.hub.register <- client
-
 	go client.writePump()
 	go client.readPump()
 }
@@ -397,7 +533,8 @@ func main() {
 
 	log.Printf("Admin room name: %s", hub.adminRoom)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.Error(w, "Not found", http.StatusNotFound)
 			return
@@ -409,9 +546,33 @@ func main() {
 		serveWs(hub, w, r)
 	})
 
-	addr := ":8080"
+	port := os.Getenv("ROOMWS_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("Server starting on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("ListenAndServe: ", err)
 	}
+	log.Println("Server stopped.")
 }

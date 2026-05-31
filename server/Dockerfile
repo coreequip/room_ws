@@ -9,7 +9,7 @@ RUN go mod download
 
 # Copy source and build
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o roomws main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-w -s" -o roomws main.go
 
 # Final stage
 FROM scratch

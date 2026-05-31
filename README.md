@@ -19,8 +19,9 @@ go run main.go
 ROOM.WS uses a simple JSON-based Pub/Sub protocol. It supports rooms, presence (join/leave events), and persistent connections.
 
 ### Environment Variables
-- `ROOMWS_ADMIN_ROOM`: Name of the administrative room (default: generated).
-- `ROOMWS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (e.g., `room.ws, localhost`).
+- `ROOMWS_PORT`: Port the server listens on (default: `8080`).
+- `ROOMWS_ADMIN_ROOM`: Name of the administrative room (default: randomly generated).
+- `ROOMWS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (e.g., `room.ws, localhost`). `localhost` and `127.0.0.1` are always allowed.
 
 ## Using the Client (`roomws.js`)
 
@@ -76,6 +77,16 @@ room.on('member_leave', memberId => {
 drone.publish({
   room: 'lobby',
   message: { text: 'Hello World!' }
+});
+```
+
+By default the server echoes published messages back to the sender (so you receive the server-assigned `id` and `timestamp`). Pass `no_echo: true` to suppress the echo, e.g. when you display your own messages optimistically:
+
+```javascript
+drone.publish({
+  room: 'lobby',
+  message: { text: 'Hello World!' },
+  no_echo: true
 });
 ```
 
