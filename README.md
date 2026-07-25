@@ -27,6 +27,9 @@ ROOM.WS uses a simple JSON-based Pub/Sub protocol. It supports rooms, presence (
 - `ROOMWS_RATE_LIMIT`: Max new WebSocket connections per second per IP (default: `5`). Set to `0` to disable.
 - `ROOMWS_RATE_BURST`: Burst size for the rate limiter (default: `10`).
 - `ROOMWS_HISTORY_SIZE`: Number of messages to retain per room for replay on subscribe (default: `0` = disabled).
+- `ROOMWS_MAX_MESSAGE_SIZE`: Max size in bytes of a single incoming WebSocket message (default: `32768`). Larger messages close the connection.
+- `ROOMWS_CLIENT_PUBLISH_RATE`: Max `publish` messages per second per connected client (default: `20`). Set to `0` to disable.
+- `ROOMWS_CLIENT_PUBLISH_BURST`: Burst size for the per-client publish rate limiter (default: `40`).
 
 ## Health Check
 
@@ -37,6 +40,18 @@ The server exposes a `/health` endpoint that returns `200 OK` with a JSON body:
 ```
 
 The Docker image uses this endpoint as its built-in `HEALTHCHECK`.
+
+## Metrics
+
+The server exposes a `/metrics` endpoint in Prometheus text format with gauges for uptime, connected clients, active rooms, goroutines, and allocated memory.
+
+Access requires a bearer token:
+
+```
+curl -H "Authorization: Bearer <token>" https://your-server/metrics
+```
+
+Set the token via `ROOMWS_METRICS_TOKEN`. If unset, a random token is generated at startup and printed to the log (`metrics token configured`).
 
 ## Using the Client (`roomws.js`)
 

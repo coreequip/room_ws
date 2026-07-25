@@ -1,0 +1,7 @@
+{
+  "name": "roomws",
+  "version": "1.0.0",
+  "description": "JavaScript client for the ROOM.WS WebSocket pub/sub protocol",
+  "main": "roomws.js",
+  "license": "MIT"
+}

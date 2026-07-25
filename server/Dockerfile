@@ -19,6 +19,10 @@ WORKDIR /
 # Copy binary from builder
 COPY --from=builder /app/roomws /roomws
 
+# Run as a non-root, unprivileged UID. FROM scratch has no /etc/passwd, but a
+# numeric UID needs no NSS lookup and the kernel enforces it regardless.
+USER 65532:65532
+
 # Expose default port
 EXPOSE 8080
 

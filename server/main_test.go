@@ -2,9 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestGenerateID(t *testing.T) {
@@ -21,7 +27,7 @@ func TestGenerateID(t *testing.T) {
 
 func TestHubIsAllowed(t *testing.T) {
 	h := newHub()
-	
+
 	tests := []struct {
 		origin   string
 		expected bool
@@ -54,7 +60,7 @@ func TestHubAdminCommands(t *testing.T) {
 	h := newHub()
 	// Use buffered channel to prevent blocking as hub.run() is not active here
 	h.broadcast = make(chan Message, 10)
-	
+
 	// Test 'add' command
 	h.handleAdminCommand("add room.ws")
 	if !h.isAllowed("https://room.ws") {
@@ -125,6 +131,114 @@ func TestMessageNoEcho(t *testing.T) {
 	}
 }
 
+func TestEnvFloatNegative(t *testing.T) {
+	os.Setenv("ROOMWS_TEST_FLOAT", "-3.5")
+	defer os.Unsetenv("ROOMWS_TEST_FLOAT")
+
+	if got := envFloat("ROOMWS_TEST_FLOAT", 5); got != 5 {
+		t.Errorf("expected fallback to default 5 for negative value, got %v", got)
+	}
+}
+
+func TestEnvFloatInvalid(t *testing.T) {
+	os.Setenv("ROOMWS_TEST_FLOAT", "not-a-number")
+	defer os.Unsetenv("ROOMWS_TEST_FLOAT")
+
+	if got := envFloat("ROOMWS_TEST_FLOAT", 5); got != 5 {
+		t.Errorf("expected fallback to default 5 for invalid value, got %v", got)
+	}
+}
+
+func TestServeWsMessageSizeLimit(t *testing.T) {
+	hub := newHub()
+	go hub.run()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveWs(hub, w, r)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	oversized := make([]byte, maxMessageSize+1024)
+	for i := range oversized {
+		oversized[i] = 'a'
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, oversized); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Error("expected server to close the connection after an oversized message")
+	}
+}
+
+func TestMetricsEndpointRequiresToken(t *testing.T) {
+	hub := newHub()
+	go hub.run()
+
+	srv := httptest.NewServer(newMux(hub))
+	defer srv.Close()
+
+	// No Authorization header at all.
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 without token, got %d", resp.StatusCode)
+	}
+
+	// Wrong token.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 with wrong token, got %d", resp.StatusCode)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	hub := newHub()
+	go hub.run()
+
+	srv := httptest.NewServer(newMux(hub))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer "+hub.metricsToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with valid token, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read body: %v", err)
+	}
+	for _, want := range []string{"roomws_uptime_seconds", "roomws_clients", "roomws_rooms", "roomws_goroutines", "roomws_memory_bytes"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("expected metrics body to contain %q, got: %s", want, body)
+		}
+	}
+}
+
 func TestHubNew(t *testing.T) {
 	customAdmin := "secret-admin-room"
 	os.Setenv("ROOMWS_ADMIN_ROOM", customAdmin)
@@ -137,5 +251,28 @@ func TestHubNew(t *testing.T) {
 
 	if !strings.HasPrefix(h.adminRoom, "secret-admin-room") {
 		t.Error("Admin room prefix mismatch")
+	}
+}
+
+func TestHubMetricsTokenGenerated(t *testing.T) {
+	h1 := newHub()
+	h2 := newHub()
+
+	if h1.metricsToken == "" {
+		t.Error("expected a generated metrics token, got empty string")
+	}
+	if h1.metricsToken == h2.metricsToken {
+		t.Error("expected generated metrics tokens to be unique per hub")
+	}
+}
+
+func TestHubMetricsTokenFromEnv(t *testing.T) {
+	customToken := "secret-metrics-token"
+	os.Setenv("ROOMWS_METRICS_TOKEN", customToken)
+	defer os.Unsetenv("ROOMWS_METRICS_TOKEN")
+
+	h := newHub()
+	if h.metricsToken != customToken {
+		t.Errorf("expected metrics token %q, got %q", customToken, h.metricsToken)
 	}
 }

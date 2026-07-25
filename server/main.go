@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,15 @@ var (
 	writeWait  = envDuration("ROOMWS_WRITE_WAIT", 10*time.Second)
 	pongWait   = envDuration("ROOMWS_PONG_WAIT", 60*time.Second)
 	pingPeriod = pongWait * 9 / 10
+
+	// maxMessageSize caps incoming WebSocket frames to prevent memory exhaustion
+	// from oversized payloads.
+	maxMessageSize = int64(envInt("ROOMWS_MAX_MESSAGE_SIZE", 32*1024))
+
+	// Per-client publish rate limiting (token bucket). Set ROOMWS_CLIENT_PUBLISH_RATE
+	// to 0 to disable.
+	clientPublishRate  = envFloat("ROOMWS_CLIENT_PUBLISH_RATE", 20)
+	clientPublishBurst = envInt("ROOMWS_CLIENT_PUBLISH_BURST", 40)
 )
 
 func envDuration(key string, def time.Duration) time.Duration {
@@ -36,7 +46,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("invalid %s=%q, using default %s", key, v, def)
+		slog.Warn("invalid duration env var, using default", "key", key, "value", v, "default", def)
 		return def
 	}
 	return d
@@ -49,7 +59,7 @@ func envInt(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
-		log.Printf("invalid %s=%q, using default %d", key, v, def)
+		slog.Warn("invalid int env var, using default", "key", key, "value", v, "default", def)
 		return def
 	}
 	return n
@@ -61,19 +71,15 @@ func envFloat(key string, def float64) float64 {
 		return def
 	}
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		log.Printf("invalid %s=%q, using default %g", key, v, def)
+	if err != nil || f < 0 {
+		slog.Warn("invalid float env var, using default", "key", key, "value", v, "default", def)
 		return def
 	}
 	return f
 }
 
 func generateID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
-	}
-	return hex.EncodeToString(b)
+	return randomToken(8)
 }
 
 // clientIP extracts the real client IP, preferring X-Forwarded-For when behind a proxy.
@@ -112,10 +118,11 @@ type Message struct {
 
 // Client represents a connected WebSocket user.
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
-	id   string
+	hub        *Hub
+	conn       *websocket.Conn
+	send       chan []byte
+	id         string
+	pubLimiter *rate.Limiter // nil when publish rate limiting is disabled
 }
 
 // ipLimiter tracks per-IP token-bucket rate limiters for new connections.
@@ -147,28 +154,39 @@ func (l *ipLimiter) allow(ip string) bool {
 
 // Hub maintains the set of active clients and broadcasts messages.
 type Hub struct {
-	clients     map[*Client]bool
-	rooms       map[string]map[*Client]bool
-	broadcast   chan Message
-	register    chan *Client
-	unregister  chan *Client
-	mu          sync.RWMutex
-	adminRoom   string
-	whitelist   map[string]bool
-	upgrader    websocket.Upgrader
-	historySize int
-	history     map[string][]Message
-	limiter     *ipLimiter // nil when rate limiting is disabled
+	clients      map[*Client]bool
+	rooms        map[string]map[*Client]bool
+	broadcast    chan Message
+	register     chan *Client
+	unregister   chan *Client
+	mu           sync.RWMutex
+	adminRoom    string
+	whitelist    map[string]bool
+	upgrader     websocket.Upgrader
+	historySize  int
+	history      map[string][]Message
+	limiter      *ipLimiter // nil when rate limiting is disabled
+	metricsToken string
+}
+
+// randomToken returns a random hex-encoded token of n bytes.
+func randomToken(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b)
 }
 
 func newHub() *Hub {
 	adminRoom := os.Getenv("ROOMWS_ADMIN_ROOM")
 	if adminRoom == "" {
-		b := make([]byte, 8)
-		if _, err := rand.Read(b); err != nil {
-			panic(fmt.Sprintf("crypto/rand failed: %v", err))
-		}
-		adminRoom = "admin-" + hex.EncodeToString(b)
+		adminRoom = "admin-" + randomToken(8)
+	}
+
+	metricsToken := os.Getenv("ROOMWS_METRICS_TOKEN")
+	if metricsToken == "" {
+		metricsToken = randomToken(16)
 	}
 
 	allowed := map[string]bool{
@@ -187,16 +205,17 @@ func newHub() *Hub {
 	}
 
 	h := &Hub{
-		broadcast:   make(chan Message),
-		register:    make(chan *Client),
-		unregister:  make(chan *Client),
-		clients:     make(map[*Client]bool),
-		rooms:       make(map[string]map[*Client]bool),
-		adminRoom:   adminRoom,
-		whitelist:   allowed,
-		historySize: envInt("ROOMWS_HISTORY_SIZE", 0),
-		history:     make(map[string][]Message),
-		limiter:     lim,
+		broadcast:    make(chan Message),
+		register:     make(chan *Client),
+		unregister:   make(chan *Client),
+		clients:      make(map[*Client]bool),
+		rooms:        make(map[string]map[*Client]bool),
+		adminRoom:    adminRoom,
+		whitelist:    allowed,
+		historySize:  envInt("ROOMWS_HISTORY_SIZE", 0),
+		history:      make(map[string][]Message),
+		limiter:      lim,
+		metricsToken: metricsToken,
 	}
 	h.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -321,7 +340,7 @@ func (h *Hub) handleAdminCommand(cmdStr string) {
 
 	respData, err := json.Marshal(responseText)
 	if err != nil {
-		log.Printf("marshal error in admin response: %v", err)
+		slog.Error("marshal error in admin response", "error", err)
 		return
 	}
 	h.broadcast <- Message{
@@ -376,7 +395,7 @@ func (h *Hub) run() {
 				}
 				data, err := json.Marshal(leaveMsg)
 				if err != nil {
-					log.Printf("marshal error for member_leave: %v", err)
+					slog.Error("marshal error for member_leave", "error", err)
 					continue
 				}
 				targets := make([]*Client, 0, len(subscribers))
@@ -399,7 +418,7 @@ func (h *Hub) run() {
 		case msg := <-h.broadcast:
 			data, err := json.Marshal(msg)
 			if err != nil {
-				log.Printf("marshal error in broadcast: %v", err)
+				slog.Error("marshal error in broadcast", "error", err)
 				continue
 			}
 
@@ -451,6 +470,7 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -461,14 +481,14 @@ func (c *Client) readPump() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				slog.Warn("unexpected close", "error", err)
 			}
 			break
 		}
 
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("unmarshal error: %v", err)
+			slog.Warn("unmarshal error", "error", err)
 			continue
 		}
 
@@ -481,7 +501,7 @@ func (c *Client) readPump() {
 			}
 			data, err := json.Marshal(resp)
 			if err != nil {
-				log.Printf("marshal error in handshake: %v", err)
+				slog.Error("marshal error in handshake", "error", err)
 				continue
 			}
 			c.send <- data
@@ -520,7 +540,7 @@ func (c *Client) readPump() {
 
 			membersData, err := json.Marshal(members)
 			if err != nil {
-				log.Printf("marshal error for members list: %v", err)
+				slog.Error("marshal error for members list", "error", err)
 				break
 			}
 			membersMsg := Message{
@@ -530,7 +550,7 @@ func (c *Client) readPump() {
 			}
 			data, err := json.Marshal(membersMsg)
 			if err != nil {
-				log.Printf("marshal error for members message: %v", err)
+				slog.Error("marshal error for members message", "error", err)
 				break
 			}
 			c.send <- data
@@ -539,7 +559,7 @@ func (c *Client) readPump() {
 			for _, hMsg := range histMsgs {
 				d, err := json.Marshal(hMsg)
 				if err != nil {
-					log.Printf("marshal error for history message: %v", err)
+					slog.Error("marshal error for history message", "error", err)
 					continue
 				}
 				c.send <- d
@@ -552,7 +572,7 @@ func (c *Client) readPump() {
 			}
 			joinData, err := json.Marshal(joinMsg)
 			if err != nil {
-				log.Printf("marshal error for member_join: %v", err)
+				slog.Error("marshal error for member_join", "error", err)
 				break
 			}
 			for _, sub := range joinTargets {
@@ -566,7 +586,7 @@ func (c *Client) readPump() {
 				resp := Message{Callback: msg.Callback}
 				respData, err := json.Marshal(resp)
 				if err != nil {
-					log.Printf("marshal error for subscribe callback: %v", err)
+					slog.Error("marshal error for subscribe callback", "error", err)
 					break
 				}
 				c.send <- respData
@@ -596,7 +616,7 @@ func (c *Client) readPump() {
 								leaveTargets = append(leaveTargets, sub)
 							}
 						} else {
-							log.Printf("marshal error for member_leave: %v", err)
+							slog.Error("marshal error for member_leave", "error", err)
 						}
 					}
 				}
@@ -611,6 +631,9 @@ func (c *Client) readPump() {
 			}
 
 		case "publish":
+			if c.pubLimiter != nil && !c.pubLimiter.Allow() {
+				continue
+			}
 			publishMsg := Message{
 				Type:      "publish",
 				Room:      msg.Room,
@@ -642,7 +665,7 @@ func (c *Client) writePump() {
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				log.Printf("write error: %v", err)
+				slog.Warn("write error", "error", err)
 				return
 			}
 		case <-ticker.C:
@@ -661,18 +684,35 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := hub.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		slog.Error("upgrade failed", "error", err)
 		return
 	}
+	var pubLimiter *rate.Limiter
+	if clientPublishRate > 0 {
+		pubLimiter = rate.NewLimiter(rate.Limit(clientPublishRate), clientPublishBurst)
+	}
 	client := &Client{
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, 256),
-		id:   generateID(),
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan []byte, 256),
+		id:         generateID(),
+		pubLimiter: pubLimiter,
 	}
 	client.hub.register <- client
 	go client.writePump()
 	go client.readPump()
+}
+
+// validMetricsToken checks the request's "Authorization: Bearer <token>" header
+// against the configured metrics token using a constant-time comparison.
+func validMetricsToken(token string, r *http.Request) bool {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+	provided := strings.TrimPrefix(auth, prefix)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func healthCheck(port string) {
@@ -681,6 +721,68 @@ func healthCheck(port string) {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// newMux builds the HTTP routes for the server. Extracted from main so it
+// can be exercised directly in tests via httptest.
+func newMux(hub *Hub) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		hub.mu.RLock()
+		clients := len(hub.clients)
+		rooms := len(hub.rooms)
+		hub.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"uptime":  time.Since(startTime).Round(time.Second).String(),
+			"clients": clients,
+			"rooms":   rooms,
+		})
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !validMetricsToken(hub.metricsToken, r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		hub.mu.RLock()
+		clients := len(hub.clients)
+		rooms := len(hub.rooms)
+		hub.mu.RUnlock()
+
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# HELP roomws_uptime_seconds Time since server start in seconds.\n")
+		fmt.Fprintf(w, "# TYPE roomws_uptime_seconds gauge\n")
+		fmt.Fprintf(w, "roomws_uptime_seconds %f\n", time.Since(startTime).Seconds())
+		fmt.Fprintf(w, "# HELP roomws_clients Number of connected clients.\n")
+		fmt.Fprintf(w, "# TYPE roomws_clients gauge\n")
+		fmt.Fprintf(w, "roomws_clients %d\n", clients)
+		fmt.Fprintf(w, "# HELP roomws_rooms Number of active rooms.\n")
+		fmt.Fprintf(w, "# TYPE roomws_rooms gauge\n")
+		fmt.Fprintf(w, "roomws_rooms %d\n", rooms)
+		fmt.Fprintf(w, "# HELP roomws_goroutines Number of goroutines.\n")
+		fmt.Fprintf(w, "# TYPE roomws_goroutines gauge\n")
+		fmt.Fprintf(w, "roomws_goroutines %d\n", runtime.NumGoroutine())
+		fmt.Fprintf(w, "# HELP roomws_memory_bytes Allocated heap memory in bytes.\n")
+		fmt.Fprintf(w, "# TYPE roomws_memory_bytes gauge\n")
+		fmt.Fprintf(w, "roomws_memory_bytes %d\n", m.Alloc)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serveWs(hub, w, r)
+	})
+	return mux
 }
 
 func main() {
@@ -697,37 +799,12 @@ func main() {
 	hub := newHub()
 	go hub.run()
 
-	log.Printf("Admin room name: %s", hub.adminRoom)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		hub.mu.RLock()
-		clients := len(hub.clients)
-		rooms := len(hub.rooms)
-		hub.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":  "ok",
-			"uptime":  time.Since(startTime).Round(time.Second).String(),
-			"clients": clients,
-			"rooms":   rooms,
-		})
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.Error(w, "Not found", http.StatusNotFound)
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		serveWs(hub, w, r)
-	})
+	slog.Info("admin room configured", "room", hub.adminRoom)
+	slog.Info("metrics token configured", "token", hub.metricsToken)
 
 	server := &http.Server{
 		Addr:    ":" + port,
-		Handler: mux,
+		Handler: newMux(hub),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -735,17 +812,18 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down server...")
+		slog.Info("shutting down server")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Shutdown error: %v", err)
+			slog.Error("shutdown error", "error", err)
 		}
 	}()
 
-	log.Printf("Server starting on :%s", port)
+	slog.Info("server starting", "port", port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal("ListenAndServe: ", err)
+		slog.Error("listen and serve failed", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Server stopped.")
+	slog.Info("server stopped")
 }

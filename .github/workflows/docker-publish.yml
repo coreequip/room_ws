@@ -6,6 +6,10 @@ on:
     paths:
       - 'server/**'
       - '.github/workflows/docker-publish.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - '.github/workflows/docker-publish.yml'
 
 env:
   REGISTRY: ghcr.io
@@ -24,6 +28,20 @@ jobs:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
 
+      - name: Check formatting
+        working-directory: server
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: server
+        run: go vet ./...
+
       - name: Run tests
         working-directory: server
         run: go test -race -count=1 ./...
@@ -31,6 +49,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     needs: test
+    if: github.event_name == 'push'
     permissions:
       contents: read
       packages: write
