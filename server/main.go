@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -167,6 +170,7 @@ type Hub struct {
 	history      map[string][]Message
 	limiter      *ipLimiter // nil when rate limiting is disabled
 	metricsToken string
+	turn         *turnConfig // nil when no TURN relay is configured
 }
 
 // randomToken returns a random hex-encoded token of n bytes.
@@ -176,6 +180,43 @@ func randomToken(n int) string {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
 	return hex.EncodeToString(b)
+}
+
+// turnConfig holds the shared secret and URLs for minting ephemeral TURN
+// credentials. It is nil unless ROOMWS_TURN_SECRET is set, which keeps the
+// server a plain pub/sub server when no TURN relay is attached.
+type turnConfig struct {
+	secret string
+	urls   []string
+	ttl    time.Duration
+}
+
+func newTurnConfig() *turnConfig {
+	secret := os.Getenv("ROOMWS_TURN_SECRET")
+	if secret == "" {
+		return nil
+	}
+	var urls []string
+	for _, u := range strings.Split(os.Getenv("ROOMWS_TURN_URLS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return &turnConfig{
+		secret: secret,
+		urls:   urls,
+		ttl:    envDuration("ROOMWS_TURN_TTL", 2*time.Hour),
+	}
+}
+
+// credentials mints a coturn REST-API credential pair: the username carries the
+// expiry, the password is its HMAC. SHA-1 is not a choice here — coturn's
+// use-auth-secret mode prescribes HMAC-SHA1.
+func (c *turnConfig) credentials(now time.Time) (username, credential string) {
+	username = fmt.Sprintf("%d:%s", now.Add(c.ttl).Unix(), randomToken(4))
+	mac := hmac.New(sha1.New, []byte(c.secret))
+	mac.Write([]byte(username))
+	return username, base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func newHub() *Hub {
@@ -216,6 +257,7 @@ func newHub() *Hub {
 		history:      make(map[string][]Message),
 		limiter:      lim,
 		metricsToken: metricsToken,
+		turn:         newTurnConfig(),
 	}
 	h.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -770,6 +812,37 @@ func newMux(hub *Hub) *http.ServeMux {
 		fmt.Fprintf(w, "# HELP roomws_memory_bytes Allocated heap memory in bytes.\n")
 		fmt.Fprintf(w, "# TYPE roomws_memory_bytes gauge\n")
 		fmt.Fprintf(w, "roomws_memory_bytes %d\n", m.Alloc)
+	})
+	mux.HandleFunc("/turn", func(w http.ResponseWriter, r *http.Request) {
+		if hub.turn == nil {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// The page is served from a different origin than this server, so the
+		// fetch needs CORS. Reuse the WebSocket origin whitelist rather than
+		// introducing a second list that can drift out of sync.
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if !hub.isAllowed(origin) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		username, credential := hub.turn.credentials(time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"iceServers": []map[string]any{{
+				"urls":       hub.turn.urls,
+				"username":   username,
+				"credential": credential,
+			}},
+			"ttl": int(hub.turn.ttl.Seconds()),
+		})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

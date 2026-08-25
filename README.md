@@ -30,6 +30,9 @@ ROOM.WS uses a simple JSON-based Pub/Sub protocol. It supports rooms, presence (
 - `ROOMWS_MAX_MESSAGE_SIZE`: Max size in bytes of a single incoming WebSocket message (default: `32768`). Larger messages close the connection.
 - `ROOMWS_CLIENT_PUBLISH_RATE`: Max `publish` messages per second per connected client (default: `20`). Set to `0` to disable.
 - `ROOMWS_CLIENT_PUBLISH_BURST`: Burst size for the per-client publish rate limiter (default: `40`).
+- `ROOMWS_TURN_SECRET`: Shared secret for minting TURN credentials. Unset (the default) disables the `/turn` endpoint entirely.
+- `ROOMWS_TURN_URLS`: Comma-separated TURN URLs handed to clients, e.g. `turn:turn.example:3478,turns:turn.example:443?transport=tcp`.
+- `ROOMWS_TURN_TTL`: Lifetime of a minted credential (default: `2h`).
 
 ## Health Check
 
@@ -52,6 +55,35 @@ curl -H "Authorization: Bearer <token>" https://your-server/metrics
 ```
 
 Set the token via `ROOMWS_METRICS_TOKEN`. If unset, a random token is generated at startup and printed to the log (`metrics token configured`).
+
+## TURN Credentials
+
+WebRTC applications built on this server can obtain relay credentials from
+`GET /turn`. The endpoint exists only when `ROOMWS_TURN_SECRET` is set;
+otherwise it returns `404`, keeping the server a plain pub/sub server.
+
+```json
+{
+  "iceServers": [
+    {
+      "urls": ["turn:turn.example:3478", "turns:turn.example:443?transport=tcp"],
+      "username": "1756118400:a1b2c3d4",
+      "credential": "base64-encoded HMAC"
+    }
+  ],
+  "ttl": 7200
+}
+```
+
+The credentials follow coturn's REST API convention: the username carries the
+expiry, and the password is `base64(HMAC-SHA1(secret, username))`. Point coturn
+at the same secret via `use-auth-secret` and `static-auth-secret`, and it will
+accept them without any shared user database.
+
+Requests carrying an `Origin` header are checked against
+`ROOMWS_ALLOWED_ORIGINS`, the same whitelist the WebSocket handshake uses.
+
+See `deploy/README.md` for a full relay setup behind Caddy.
 
 ## Using the Client (`roomws.js`)
 

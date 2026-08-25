@@ -1,11 +1,15 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -274,5 +278,174 @@ func TestHubMetricsTokenFromEnv(t *testing.T) {
 	h := newHub()
 	if h.metricsToken != customToken {
 		t.Errorf("expected metrics token %q, got %q", customToken, h.metricsToken)
+	}
+}
+
+func TestTurnEndpointReturnsHMACCredentials(t *testing.T) {
+	os.Setenv("ROOMWS_TURN_SECRET", "s3cr3t")
+	os.Setenv("ROOMWS_TURN_URLS", "turns:turn.room.ws:443?transport=tcp,turn:turn.room.ws:3478")
+	os.Setenv("ROOMWS_TURN_TTL", "2h")
+	defer func() {
+		os.Unsetenv("ROOMWS_TURN_SECRET")
+		os.Unsetenv("ROOMWS_TURN_URLS")
+		os.Unsetenv("ROOMWS_TURN_TTL")
+	}()
+
+	h := newHub()
+	srv := httptest.NewServer(newMux(h))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/turn")
+	if err != nil {
+		t.Fatalf("GET /turn: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", resp.StatusCode)
+	}
+
+	var got struct {
+		IceServers []struct {
+			URLs       []string `json:"urls"`
+			Username   string   `json:"username"`
+			Credential string   `json:"credential"`
+		} `json:"iceServers"`
+		TTL int `json:"ttl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.IceServers) != 1 {
+		t.Fatalf("Expected 1 ice server entry, got %d", len(got.IceServers))
+	}
+	entry := got.IceServers[0]
+
+	want := []string{"turns:turn.room.ws:443?transport=tcp", "turn:turn.room.ws:3478"}
+	if len(entry.URLs) != len(want) {
+		t.Fatalf("Expected %d urls, got %v", len(want), entry.URLs)
+	}
+	for i, u := range want {
+		if entry.URLs[i] != u {
+			t.Errorf("urls[%d] = %q; want %q", i, entry.URLs[i], u)
+		}
+	}
+
+	// coturn REST API: username is "<unix-expiry>:<name>", credential is
+	// base64(HMAC-SHA1(secret, username)).
+	expiry, name, found := strings.Cut(entry.Username, ":")
+	if !found || name == "" {
+		t.Fatalf("username %q is not in <expiry>:<name> form", entry.Username)
+	}
+	ts, err := strconv.ParseInt(expiry, 10, 64)
+	if err != nil {
+		t.Fatalf("username expiry %q is not a unix timestamp: %v", expiry, err)
+	}
+	if delta := time.Until(time.Unix(ts, 0)) - 2*time.Hour; delta > time.Minute || delta < -time.Minute {
+		t.Errorf("expiry is %v off from the configured TTL", delta)
+	}
+
+	mac := hmac.New(sha1.New, []byte("s3cr3t"))
+	mac.Write([]byte(entry.Username))
+	wantCred := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	if entry.Credential != wantCred {
+		t.Errorf("credential = %q; want %q", entry.Credential, wantCred)
+	}
+
+	if got.TTL != int((2 * time.Hour).Seconds()) {
+		t.Errorf("ttl = %d; want %d", got.TTL, int((2 * time.Hour).Seconds()))
+	}
+}
+
+func TestTurnEndpointDisabledWithoutSecret(t *testing.T) {
+	os.Unsetenv("ROOMWS_TURN_SECRET")
+
+	h := newHub()
+	srv := httptest.NewServer(newMux(h))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/turn")
+	if err != nil {
+		t.Fatalf("GET /turn: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected 404 when no TURN secret is configured, got %d", resp.StatusCode)
+	}
+}
+
+func TestTurnEndpointAllowsConfiguredOrigin(t *testing.T) {
+	os.Setenv("ROOMWS_TURN_SECRET", "s3cr3t")
+	os.Setenv("ROOMWS_ALLOWED_ORIGINS", "share.room.ws")
+	defer func() {
+		os.Unsetenv("ROOMWS_TURN_SECRET")
+		os.Unsetenv("ROOMWS_ALLOWED_ORIGINS")
+	}()
+
+	h := newHub()
+	srv := httptest.NewServer(newMux(h))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/turn", nil)
+	req.Header.Set("Origin", "https://share.room.ws")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /turn: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://share.room.ws" {
+		t.Errorf("Access-Control-Allow-Origin = %q; want the request origin", got)
+	}
+	if got := resp.Header.Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Errorf("Vary = %q; want it to contain Origin", got)
+	}
+}
+
+func TestTurnEndpointRejectsForeignOrigin(t *testing.T) {
+	os.Setenv("ROOMWS_TURN_SECRET", "s3cr3t")
+	defer os.Unsetenv("ROOMWS_TURN_SECRET")
+
+	h := newHub()
+	srv := httptest.NewServer(newMux(h))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/turn", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /turn: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected 403 for a foreign origin, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Expected no CORS header for a rejected origin, got %q", got)
+	}
+}
+
+func TestTurnEndpointRejectsNonGET(t *testing.T) {
+	os.Setenv("ROOMWS_TURN_SECRET", "s3cr3t")
+	defer os.Unsetenv("ROOMWS_TURN_SECRET")
+
+	h := newHub()
+	srv := httptest.NewServer(newMux(h))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/turn", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /turn: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected 405, got %d", resp.StatusCode)
 	}
 }
